@@ -20,24 +20,28 @@ uint8_t AHTX0_STATUS_CALIBRATED = 0x08;  // Status bit for calibrated
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define LOGO_HEIGHT   16
 #define LOGO_WIDTH    16
+bool AHT10_functioning = true;
 
-void transmit(uint8_t address, uint8_t buffer[], uint8_t buffer_size) {
+bool transmit(uint8_t address, uint8_t buffer[], uint8_t buffer_size) {
   delay(10); // This device needs some space after other I2C devices are done talking
   Wire.beginTransmission(address);
   uint8_t write_result = Wire.write(buffer, buffer_size);
   if (write_result != buffer_size) {
-    Serial.write("Failed to write reset command\n");
+    Serial.write("Failed to write I2C message\n");
+    return false;
   }
   uint8_t transmission_result = Wire.endTransmission(true);
   if (transmission_result != 0) {
     Serial.write("Wire transmission failed, error code:");
     Serial.print(transmission_result);
     Serial.write(".\n");
+    return false;
   }
+  return true;
 }
 uint8_t receive(uint8_t address, uint8_t out_buffer[], uint8_t buffer_size) {
   for (int i = 0; i < buffer_size; ++i) {
-    out_buffer[i] = 0x00;
+    out_buffer[i] = 0xFF;
   }
   Wire.requestFrom(address, (uint8_t)buffer_size);
   for (int i = 0; i < buffer_size; ++i) {
@@ -61,8 +65,11 @@ uint8_t receive(uint8_t address, uint8_t out_buffer[], uint8_t buffer_size) {
 
 uint8_t get_status(uint8_t address, bool print) {
     uint8_t buffer[1];
-    receive(address, buffer, 1);
+    uint8_t received_length = receive(address, buffer, 1);
     uint8_t status = buffer[0];
+    if (received_length != 1) {
+        status = 0xFF;
+    }
     if (print) {
       Serial.print("Status: 0x");
       Serial.print(status, 16);
@@ -94,8 +101,33 @@ void calibrate(uint8_t address) {
     Serial.print("Calibrated\n");
   }
 }
-void read_data(uint8_t address, float &out_humidity, float &out_temperature, bool print) {
-  transmit(address, AHTX0_CMD_TRIGGER, 3);
+
+void initialize() {
+    uint8_t address = AHTX0_I2CADDR_DEFAULT;
+    Wire.begin(address);
+    delay(20);
+    send_reset(address);
+    delay(20);
+    uint8_t status = get_status(address, true);
+    int attempts = 0;
+    while (status == 0xFF && attempts < 100) {
+        get_status(address, false);
+        attempts += 1;
+        delay(20);
+    }
+    if (status == 0xFF) {
+        AHT10_functioning = false;
+        Serial.print("AHT10 didn't respond.");
+    }
+    calibrate(address);
+}
+
+// Returns success
+bool read_data(uint8_t address, float &out_humidity, float &out_temperature, bool print) {
+  bool transmitted = transmit(address, AHTX0_CMD_TRIGGER, 3);
+  if (!transmitted) {
+      return false;
+  }
 
   int attempts = 0;
   uint8_t status = get_status(address, false);
@@ -107,7 +139,7 @@ void read_data(uint8_t address, float &out_humidity, float &out_temperature, boo
     if (print) {
       Serial.print("Failed to generate new data.\n");
     }
-    return;
+    return false;
   }
   const uint8_t buffer_size = 6;
   uint8_t buffer[buffer_size];
@@ -118,6 +150,7 @@ void read_data(uint8_t address, float &out_humidity, float &out_temperature, boo
     Serial.print("/");
     Serial.print(buffer_size);
     Serial.print(" bytes.\n");
+    return false;
   }
   if (print) {
     Serial.print("Raw data: ");
@@ -143,23 +176,17 @@ void read_data(uint8_t address, float &out_humidity, float &out_temperature, boo
 
   out_humidity = (((float)raw_humidity) * 100) / 0x100000;
   out_temperature = ((((float)raw_temperature) * 200) / 0x100000) - 50;
+  return true;
 }
 
 void setup() {
   delay(20);
   Serial.begin(9600);
   Serial.write("--- Restart ---\n");
-  
   Wire.begin();
-  uint8_t address = AHTX0_I2CADDR_DEFAULT;
-  Wire.begin(address);
-  delay(20);
-  uint8_t status = get_status(address, true);
-  while (status == 0xFF) {
-    get_status(address, true);
-    delay(2000);
-  }
-  calibrate(address);
+
+  initialize();
+
   // */
 
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
@@ -195,26 +222,34 @@ void loop() {
   display.cp437(true);         // Use full 256 char 'Code Page 437' font
   display.display();
   while (true) {
-    uint8_t address = AHTX0_I2CADDR_DEFAULT;
-    float humidity = 0.0f;
-    float temperature = 0.0f;
-    read_data(address, humidity, temperature, false);
-    Serial.print("Humidity: ");
-    Serial.print(humidity);
-    Serial.print("%, temperature: ");
-    Serial.print(temperature);
-    Serial.print(" degrees Celcius\n");
-    // */
+    if (AHT10_functioning) {
 
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    writeString("\nTEMPERATURE = ");
-    writeFloatString(temperature);
-    writeString(", HUMIDITY = ");
-    writeFloatString(humidity);
-    writeString("\n");
-    display.display();
-    
+        float humidity = 0.0f;
+        float temperature = 0.0f;
+        uint8_t address = AHTX0_I2CADDR_DEFAULT;
+        bool success = read_data(address, humidity, temperature, false);
+        if (!success) {
+            initialize();
+        }
+        Serial.print("Humidity: ");
+        Serial.print(humidity);
+        Serial.print("%, temperature: ");
+        Serial.print(temperature);
+        Serial.print(" degrees Celcius\n");
+        // */
+
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        writeString("\nTEMPERATURE = ");
+        writeFloatString(temperature);
+        writeString(", HUMIDITY = ");
+        writeFloatString(humidity);
+        writeString("\n");
+    } else {
+        writeString("AHT10 IS NOT RESPONDING\n");
+    }
+      display.display();
+
     delay(2000);
   }
 }
