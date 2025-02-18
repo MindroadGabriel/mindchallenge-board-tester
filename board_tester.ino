@@ -38,6 +38,7 @@ float AHT10_temperature = 0.0f;
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
 #define OLED_RESET 4  // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+uint8_t display_buffer[SCREEN_WIDTH * ((SCREEN_HEIGHT + 7) / 8)];
 #define LOGO_HEIGHT 16
 #define LOGO_WIDTH 16
 bool SSD1306_ok = false;
@@ -51,7 +52,12 @@ bool SSD1306_ok = false;
 #define BUTTON2_PIN 4
 #endif
 
-bool transmit(uint8_t address, uint8_t buffer[], uint8_t buffer_size) {
+class Adafruit_BufferEdit : public Adafruit_SSD1306 {
+public:
+    void setBuffer(uint8_t *new_buffer) { buffer = new_buffer; }
+};
+
+bool AHT10_transmit(uint8_t address, uint8_t buffer[], uint8_t buffer_size) {
     delay(10);  // This device needs some space after other I2C devices are done talking
     Wire.beginTransmission(address);
     uint8_t write_result = Wire.write(buffer, buffer_size);
@@ -68,7 +74,7 @@ bool transmit(uint8_t address, uint8_t buffer[], uint8_t buffer_size) {
     }
     return true;
 }
-uint8_t receive(uint8_t address, uint8_t out_buffer[], uint8_t buffer_size) {
+uint8_t AHT10_receive(uint8_t address, uint8_t out_buffer[], uint8_t buffer_size) {
     for (int i = 0; i < buffer_size; ++i) {
         out_buffer[i] = 0xFF;
     }
@@ -94,7 +100,7 @@ uint8_t receive(uint8_t address, uint8_t out_buffer[], uint8_t buffer_size) {
 
 uint8_t get_status(uint8_t address, bool print) {
     uint8_t buffer[1];
-    uint8_t received_length = receive(address, buffer, 1);
+    uint8_t received_length = AHT10_receive(address, buffer, 1);
     uint8_t status = buffer[0];
     if (received_length != 1) {
         status = 0xFF;
@@ -110,15 +116,8 @@ uint8_t get_status(uint8_t address, bool print) {
     }
     return status;
 }
-bool send_reset(uint8_t address) {
-    if (!transmit(address, &AHTX0_CMD_SOFTRESET, 1)) {
-        return false;
-    }
-    delay(20);
-    return true;
-}
 Status calibrate(uint8_t address) {
-    if (!transmit(address, AHT10_CMD_CALIBRATE, 3)) {
+    if (!AHT10_transmit(address, AHT10_CMD_CALIBRATE, 3)) {
         return Status::StoppedResponding;
     }
     Serial.print("Calibrating.\n");
@@ -138,11 +137,11 @@ Status calibrate(uint8_t address) {
     }
 }
 
-Status initialize() {
+Status AHT10_initialize() {
     uint8_t address = AHTX0_I2CADDR_DEFAULT;
     Wire.begin(address);
     delay(20);
-    if (!send_reset(address)) {
+    if (!AHT10_transmit(address, &AHTX0_CMD_SOFTRESET, 1)) {
         // Let reset fail, it's optional, and instead have the repeating status be
         // the more reliable sign that the circuit is broken
         //return Status::NotResponding;
@@ -161,29 +160,17 @@ Status initialize() {
     }
     return calibrate(address);
 }
-
-// Returns success
-bool read_data(uint8_t address, float& out_humidity, float& out_temperature, bool print) {
-    bool transmitted = transmit(address, AHTX0_CMD_TRIGGER, 3);
-    if (!transmitted) {
-        return false;
-    }
-
-    int attempts = 0;
-    uint8_t status = get_status(address, false);
-    while ((status & AHTX0_STATUS_BUSY) != 0 && attempts < 100) {
-        delay(2000);
-        status = get_status(address, print);
-    }
+bool AHT10_read_data_start(uint8_t address) {
+    return AHT10_transmit(address, AHTX0_CMD_TRIGGER, 3);
+}
+bool AHT10_read_data_result(uint8_t address, uint8_t status, float& out_humidity, float& out_temperature, bool print) {
     if ((status & AHTX0_STATUS_BUSY) != 0) {
-        if (print) {
-            Serial.print("Failed to generate new data.\n");
-        }
+        Serial.println("read_data_result called with busy status");
         return false;
     }
     const uint8_t buffer_size = 6;
     uint8_t buffer[buffer_size];
-    uint8_t received_length = receive(address, buffer, buffer_size);
+    uint8_t received_length = AHT10_receive(address, buffer, buffer_size);
     if (received_length != buffer_size) {
         Serial.print("Failed to read all bytes when reading data. Read ");
         Serial.print(received_length);
@@ -263,10 +250,11 @@ void setup() {
         BMI160_status = Status::Ok;
     }
     Serial.write("AHT10 init\n");
-    AHT10_status = initialize();
+    AHT10_status = AHT10_initialize();
 
     Serial.write("Display init\n");
-    if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
+    static_cast<Adafruit_BufferEdit*>(&display)->setBuffer(display_buffer);
+    if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {  // Address 0x3C for 128x32
         SSD1306_ok = true;
 
         display.setTextSize(1);       // Normal 1:1 pixel scale
@@ -276,7 +264,7 @@ void setup() {
         display.display();
     } else {
         SSD1306_ok = false;
-        Serial.println(F("SSD1306 allocation failed"));
+        Serial.println("SSD1306 allocation failed");
     }
 
 #if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
@@ -305,14 +293,29 @@ void loop() {
     } else if (AHT10_status == Status::StoppedResponding) {
         writeString("AHT10: Stopped responding\n");
     } else if (AHT10_status == Status::Ok) {
-        bool success = read_data(AHTX0_I2CADDR_DEFAULT, AHT10_humidity, AHT10_temperature, false);
-        //writeString("AHT10: H22 T26\n");
-        writeString("AHT10: H");
-        writeIntString((uint32_t) AHT10_humidity);
-        writeString("% T");
-        //writeIntString((uint32_t) temperature);
-        writeFloatString(AHT10_temperature);
-        writeString("C\n");
+        uint8_t address = AHTX0_I2CADDR_DEFAULT;
+        if (!AHT10_read_data_start(address)) {
+            AHT10_status = Status::StoppedResponding;
+        }
+        int attempts = 0;
+        uint8_t status = get_status(address, false);
+        while ((status & AHTX0_STATUS_BUSY) != 0 && attempts < 100) {
+            delay(2000);
+            status = get_status(address, false);
+        }
+        if ((status & AHTX0_STATUS_BUSY) != 0) {
+            Serial.print("Failed to generate new data.\n");
+            AHT10_status = Status::StoppedResponding;
+        } else {
+            bool success = AHT10_read_data_result(address, status, AHT10_humidity, AHT10_temperature, false);
+            //writeString("AHT10: H22 T26\n");
+            writeString("AHT10: H");
+            writeIntString((uint32_t) AHT10_humidity);
+            writeString("% T");
+            //writeIntString((uint32_t) temperature);
+            writeFloatString(AHT10_temperature);
+            writeString("C\n");
+        }
     }
     if (BMI160_status == Status::Unknown) {
         writeString("BMI160: Unknown\n");
