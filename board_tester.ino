@@ -37,8 +37,10 @@ uint8_t AHTX0_STATUS_BUSY = 0x80;                       // Status bit for busy
 uint8_t AHTX0_STATUS_CALIBRATED = 0x08;                 // Status bit for calibrated
 // Status of the AHT10.
 Status AHT10_status = Status::Unknown;
-// Remaining attempts to get a status
-uint16_t AHT10_attempts = 0;
+// Remaining attempts to get a status,
+// or remaining iterations until we do another measurement,
+// depending on status Measuring or Ok
+uint16_t AHT10_counter = 0;
 // Last measured values
 float AHT10_humidity = 0.0f;
 float AHT10_temperature = 0.0f;
@@ -307,6 +309,9 @@ void setup() {
         Serial.println("SSD1306 allocation failed");
     }
 
+    // Initialize our buttons with an internal pullup.
+    // This means that we don't need any external resistors that connect the input line to voltage
+    // in order to detect that the button has been connected to ground (been pressed)
     pinMode(BUTTON1_PIN, INPUT_PULLUP);
     pinMode(BUTTON2_PIN, INPUT_PULLUP);
 }
@@ -331,24 +336,31 @@ void loop() {
     } else if (AHT10_status == Status::StoppedResponding) {
         writeString("AHT10: Stopped responding\n");
     } else if (AHT10_status == Status::Ok || AHT10_status == Status::Measuring) {
-        // This sensor freezes the arduino after a random amount of time for some reason.
-        // That amount of time is larger if it gets some space between its communication and other sensor's
         uint8_t address = AHTX0_I2CADDR_DEFAULT;
-        delay(50);
         // The "Ok" status is reinterpreted as "Ok, and not currently measuring"
         if (AHT10_status == Status::Ok) {
-            if (AHT10_read_data_start(address)) {
-                AHT10_status = Status::Measuring;
-                AHT10_attempts = 0;
+            // We measure less often as another mitigation for the freezing behaviour described below
+            if (AHT10_counter > 0) {
+                AHT10_counter -= 1;
             } else {
-                AHT10_status = Status::StoppedResponding;
+                delay(50);
+                if (AHT10_read_data_start(address)) {
+                    AHT10_status = Status::Measuring;
+                    AHT10_counter = 0;
+                    delay(50);
+                } else {
+                    AHT10_status = Status::StoppedResponding;
+                }
             }
         } else /* if (AHT10_status == Status::Measuring( */ {
+            // This sensor freezes the arduino after a random amount of time for some reason.
+            // That amount of time is larger if it gets some space between its communication and other sensor's
+            delay(50);
             uint8_t status = AHT10_get_status(address, false);
             if ((status & AHTX0_STATUS_BUSY) != 0) {
                 // Busy
-                AHT10_attempts += 1;
-                if (AHT10_attempts > 10000) {
+                AHT10_counter += 1;
+                if (AHT10_counter > 10000) {
                     AHT10_status = Status::StoppedResponding;
                     Serial.print("Failed to generate new data.\n");
                 }
@@ -357,12 +369,16 @@ void loop() {
                 bool success = AHT10_read_data_result(address, status, AHT10_humidity, AHT10_temperature, false);
                 if (success) {
                     AHT10_status = Status::Ok;
+                    // We wait 100 iterations until we try to get temperature or humidity again,
+                    // to not interact with the sensor more than we need to,
+                    // since interaction seems related to the arduino freezing.
+                    AHT10_counter = 100;
                 } else {
                     AHT10_status = Status::StoppedResponding;
                 }
             }
+            delay(50);
         }
-        delay(50);
 
         // Print the latest cached values. If these are zero on the screen,
         // it's likely the measurement hasn't succeeded even once.
