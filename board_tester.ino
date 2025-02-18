@@ -40,6 +40,7 @@ int16_t AHT10_temperature_cents = 0.0f;
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
 #define OLED_RESET 4  // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+uint8_t display_buffer[SCREEN_WIDTH * ((SCREEN_HEIGHT + 7) / 8)];
 #define LOGO_HEIGHT 16
 #define LOGO_WIDTH 16
 bool SSD1306_ok = false;
@@ -52,6 +53,11 @@ bool SSD1306_ok = false;
 #define BUTTON1_PIN 5
 #define BUTTON2_PIN 4
 #endif
+
+class Adafruit_BufferEdit : public Adafruit_SSD1306 {
+public:
+    void setBuffer(uint8_t *new_buffer) { buffer = new_buffer; }
+};
 
 bool AHT10_transmit(uint8_t address, uint8_t buffer[], uint8_t buffer_size) {
     delay(10);  // This device needs some space after other I2C devices are done talking
@@ -239,6 +245,7 @@ void setup() {
     Wire.begin();
 
     Serial.write("Display init\n");
+    static_cast<Adafruit_BufferEdit*>(&display)->setBuffer(display_buffer);
     if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {  // Address 0x3C for 128x32
         SSD1306_ok = true;
 
@@ -340,13 +347,11 @@ void loop() {
         IMU.update();
         IMU.getAccel(&accelData);
         float temperature = IMU.getTemp();
-        float accelY = accelData.accelY;
-        float accelX = accelData.accelX;
         int16_t center_x = SCREEN_WIDTH - (BOX_SIDE / 2);
         int16_t center_y = SCREEN_HEIGHT - (BOX_SIDE / 2);
         float factor = 50.0f;
-        int16_t x = accelY * factor;
-        int16_t y = accelX * factor;
+        int16_t x = accelData.accelY * factor;
+        int16_t y = accelData.accelX * factor;
 
         int16_t extents = BOX_SIDE / 2 - 4;
         if (x > extents) {
@@ -366,9 +371,9 @@ void loop() {
 
         //writeString("BMI160: X0Y0 T26\n");
         writeString("BMI160: X");
-        writeIntString((uint32_t) (accelX*100));
+        writeIntString((uint32_t) (accelData.accelX*100));
         writeString("Y");
-        writeIntString((uint32_t) (accelY*100));
+        writeIntString((uint32_t) (accelData.accelY*100));
         writeString(" T");
         //writeIntString((uint32_t) temperature);
         writeFloatString(temperature);
@@ -393,7 +398,6 @@ void loop() {
     if (SSD1306_ok) {
         display.display();
     } else {
-        // If the display is not working,
         // Give ourselves a chance to read the serial log
         delay(2000);
     }
