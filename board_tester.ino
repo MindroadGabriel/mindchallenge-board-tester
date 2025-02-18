@@ -1,14 +1,99 @@
-#include <Adafruit_SSD1306.h>
-#include <splash.h>
-#include <stdlib.h>
+// This software is a tester for MindRoad Mind Challenge circuit boards,
+// for revision 1 through 3, where rev 3 can be identified as the first
+// board vision that can take either an Arduino Nano or a Raspberry Pi Pico
 
-#include <Wire.h>
+// The software displays data about the state of the connected hardware
+// in order to allow for figuring out if your solder job was good or not.
+
+// Usage instructions, (windows):
+// To use it, install Arduino IDE. I use version 2.3.4. https://www.arduino.cc/en/software
+// Then open this .ino file in Arduino IDE.
+// Try compiling with check mark in the top left.
+// It will most likely fail due to missing dependencies.
+// To address this, open library manager (pile of books icon in the left sidebar)
+// From there, search for each of these dependencies:
+// Adafruit SSD1306 by Adafruit (I use version 2.5.13)
+// FastIMU by LiquidCGS (I use version 1.2.8)
+// Then try compiling again.
+
+// If you're using Arduino Nano, the next step is to plug in your board.
+// From the Tools dropdown menu, select
+// Board: Arduino Nano
+// Port: Whichever port disappears when you disconnect your board.
+// Programmer: ATmega328P, or ATmega328P (Old bootloader), try one then the other
+
+// If you're using Raspberry Pi Pico, you need to install the board support package
+// for Raspberry Pi Pico. Plug it in, and select Raspberry Pi Pico under the tools -> board menu
+// and the IDE should offer to install the board support package.
+// If it doesn't, check the boards manager (in the left bar, second icon down)
+// and install Arduino Mbed OS RP2040 Boards by Arduino (I use version 4.2.1)
+// At this point you can try compiling and uploading the software, and it might
+// upload okay, but nothing will display on the screen.
+// This is because the Arduino SDK does not support changing I2C pins,
+// at least in the version I use. The only fix I've found for this is to
+// change the default pins in the board support package.
+// For me, the relevant file can be found at
+// C:\Users\Gabriel\AppData\Local\Arduino15\packages\arduino\hardware\mbed_rp2040\4.2.1\variants\RASPBERRY_PI_PICO\pins_arduino.h
+// And I change these lines
+//#define PIN_WIRE_SDA        (4u)
+//#define PIN_WIRE_SCL        (5u)
+// to this
+//#define PIN_WIRE_SDA        (20u)
+//#define PIN_WIRE_SCL        (21u)
+// This will change everything you compile for Raspberry Pi Pico to use those pins,
+// so remember to change back if you use an board which is wired with default I2C pins.
+// After this, put the Raspberry Pi Pico in bootloader mode
+// by holding the BOOTSEL physical button on the actual board while inserting the USB cable into the computer.
+// A windows explorer window not unlike when you insert a USB flash drive should appear.
+// Then use the Upload button in Arduino IDE (Arrow icon in the top left)
+
+// Once the software is running on the board, you will have a set of values appear
+// on the small attached screen if it's soldered correctly.
+// The values on the screen from top to bottom are:
+// One row for the AHT10 temperature and humidity sensor (dark blue 4 pins small board).
+//   It shows the current ambient humidity in % and current temperature in Celcius
+//   Or an error message to indicate the AHT10 did not respond.
+// One row for the BMI160 inertial measurement unit/accelerometer (purple 4 pins small board)
+//   It shows the current x and y axis rotations from the accelerometer,
+//   as well as the temperature in celcius as measured by the BMI160 (it, too, has a thermometer).
+//   Or an error message.
+// One row for buttons, which display "DOWN" if they're currently being pressed
+// Optionally one row for potentiometers (knobs to turn) displaying the 12-bit ADC (analog to digital converter) value,
+//   meaning a value from 0 to 1023 that stretches from 0 V to 3.3 V.
+//   This row is only relevant for Rev3 boards, so it only appears if you're using Raspberry Pi Pico,
+//   or have set the ARDUINO_ON_REV3 macro below to 1.
+// Finally, a circle bounded by a square in the bottom right which
+//   graphically conveys the current measurement value of the BMI160.
+//   This only appears if the BMI160 is responding.
+// If one of the fields don't show the values you expect, check your
+// solders again for connection, especially on the SCL and SDA pins.
+
+// Have fun with your board!
+
+// Author Gabriel Nilsson
+
+#include <stdlib.h>
 #include <inttypes.h>
-#include "FastIMU.h"
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <FastIMU.h>
 
 // If we have a new board, which can contain both a raspberry and an arduino,
-// but nevertheless we have have an arduino mounted, set this to true.
-#define ARDUINO_ON_NEW_BOARD 0
+// and we have an arduino mounted, set this to 1.
+#define ARDUINO_ON_REV3 0
+
+#if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
+#define RASPBERRY_PI_PICO 1
+#else
+#define RASPBERRY_PI_PICO 0
+#endif
+
+#if ARDUINO_ON_REV3 || RASPBERRY_PI_PICO
+#define REV3_BOARD 1
+#else
+// Rev3 false implies that it's rev2 or rev 1, which both look the same
+#define REV3_BOARD 0
+#endif
 
 // The status reflects our understanding of the current state of each sensor
 enum class Status {
@@ -66,8 +151,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // We statically allocate it instead, and assign it despite it being protected
 // via a subclass hack
 // We skip this on raspberry pi though
-#if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
-#else
+#if !RASPBERRY_PI_PICO
 uint8_t display_buffer[SCREEN_WIDTH * ((SCREEN_HEIGHT + 7) / 8)];
 class Adafruit_BufferEdit : public Adafruit_SSD1306 {
 public:
@@ -77,7 +161,7 @@ public:
 
 // Buttons
 // Pins for buttons vary depending on hardware
-#if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
+#if RASPBERRY_PI_PICO
 // If we're on raspberry pi pico
 #define BUTTON1_PIN 7
 #define BUTTON2_PIN 8
@@ -256,7 +340,7 @@ void writeString(char* text) {
 
 void writeFloatString(float n) {
     char buffer[32];
-#if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
+#if RASPBERRY_PI_PICO
     sprintf(buffer, "%.1f", n);
 #else
     dtostrf(n, 4, 1, buffer);
@@ -265,7 +349,7 @@ void writeFloatString(float n) {
 }
 void writeIntString(uint32_t n) {
     char buffer[32];
-#if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
+#if RASPBERRY_PI_PICO
     sprintf(buffer, "%d", n);
 #else
     itoa(n, buffer, 10);
@@ -305,8 +389,7 @@ void setup() {
     // Set up our display using the hack we wrote above.
     // But not if we're on raspberry pi
     Serial.write("Display init\n");
-#if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
-#else
+#if !RASPBERRY_PI_PICO
     static_cast<Adafruit_BufferEdit*>(&display)->setBuffer(display_buffer);
 #endif
     // If this fails and ok is set to false, we write nothing to the display,
@@ -351,7 +434,7 @@ void loop() {
     } else if (AHT10_status == Status::NotResponding) {
         writeString("AHT10: No response\n");
     } else if (AHT10_status == Status::StoppedResponding) {
-        writeString("AHT10: Stopped responding\n");
+        writeString("AHT10: Stopped resp\n");
     } else if (AHT10_status == Status::Ok || AHT10_status == Status::Measuring) {
         uint8_t address = AHTX0_I2CADDR_DEFAULT;
         // The "Ok" status is reinterpreted as "Ok, and not currently measuring"
@@ -413,7 +496,7 @@ void loop() {
     } else if (BMI160_status == Status::NotResponding) {
         writeString("BMI160: No response\n");
     } else if (BMI160_status == Status::StoppedResponding) {
-        writeString("BMI160: Stopped responding\n");
+        writeString("BMI160: Stopped resp\n");
     } else if (BMI160_status == Status::Ok) {
         // IMU.update() actually gets new data from the sensor.
         // The getAccel() and getTemp() calls get it from the storage in the class
@@ -429,7 +512,7 @@ void loop() {
         float factor = 50.0f;
 
         // Screen coordinate for the circle
-#if (BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0) || ARDUINO_ON_NEW_BOARD != 0
+#if REV3_BOARD
         // On the new board raspberry pi board, the orientation of the accelerometer
         // is not the same as the old board, so we do this transformation
         int16_t x = -accelData.accelX * factor;
@@ -485,11 +568,12 @@ void loop() {
     }
     writeString("\n");
 
+#if REV3_BOARD
     writeString("P1: ");
     writeIntString(analogRead(POTENTIOMETER1_PIN));
     writeString(", P2: ");
     writeIntString(analogRead(POTENTIOMETER2_PIN));
-    writeString("");
+#endif
     // Finally we print our internal buffer.
     // You must remember this step in your own application if you use the display,
     // otherwise nothing will render at all.
