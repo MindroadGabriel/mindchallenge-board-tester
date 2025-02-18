@@ -81,9 +81,13 @@ public:
 // If we're on raspberry pi pico
 #define BUTTON1_PIN 7
 #define BUTTON2_PIN 8
+#define POTENTIOMETER1_PIN 26
+#define POTENTIOMETER2_PIN 27
 #else
 #define BUTTON1_PIN 5
 #define BUTTON2_PIN 4
+#define POTENTIOMETER1_PIN A0
+#define POTENTIOMETER2_PIN A1
 #endif
 
 ////////////////////////////////////
@@ -481,6 +485,11 @@ void loop() {
     }
     writeString("\n");
 
+    writeString("P1: ");
+    writeIntString(analogRead(POTENTIOMETER1_PIN));
+    writeString(", P2: ");
+    writeIntString(analogRead(POTENTIOMETER2_PIN));
+    writeString("");
     // Finally we print our internal buffer.
     // You must remember this step in your own application if you use the display,
     // otherwise nothing will render at all.
