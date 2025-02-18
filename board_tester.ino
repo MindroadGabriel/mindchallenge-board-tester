@@ -2,8 +2,6 @@
 #include <splash.h>
 #include <stdlib.h>
 
-#include <Bounce2.h>
-
 #include <Wire.h>
 #include <inttypes.h>
 #include "FastIMU.h"
@@ -13,12 +11,12 @@ enum class Status {
     NotResponding,
     StoppedResponding,
     Ok,
+    Measuring,
+    AllocationFailed,
 };
 
 #define IMU_ADDRESS 0x69  //Change to the address of the IMU
 BMI160 IMU;               //Change to the name of any supported IMU!
-calData calib = {0};    //Calibration data
-AccelData accelData;      //Sensor data
 #define CIRCLE_RADIUS 3
 Status BMI160_status = Status::Unknown;
 
@@ -29,22 +27,33 @@ uint8_t AHTX0_CMD_SOFTRESET = 0xBA;                     // Soft reset command
 uint8_t AHTX0_STATUS_BUSY = 0x80;                       // Status bit for busy
 uint8_t AHTX0_STATUS_CALIBRATED = 0x08;                 // Status bit for calibrated
 Status AHT10_status = Status::Unknown;
+uint16_t AHT10_attempts = 0;
+
+int16_t AHT10_humidity_cents = 0.0f;
+int16_t AHT10_temperature_cents = 0.0f;
 
 
 #define SCREEN_WIDTH 128  // OLED display width, in pixels
 #define SCREEN_HEIGHT 32  // OLED display height, in pixels
+#define BOX_SIDE 16  // Size in pixels of the bounds of the gyro testing square
 
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
 #define OLED_RESET 4  // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define LOGO_HEIGHT 16
 #define LOGO_WIDTH 16
-Status SSD1306_status = Status::Unknown;
+bool SSD1306_ok = false;
 
-Bounce button1 = Bounce();
-Bounce button2 = Bounce();
+#if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
+// If we're on raspberry pi pico
+#define BUTTON1_PIN 7
+#define BUTTON2_PIN 8
+#else
+#define BUTTON1_PIN 5
+#define BUTTON2_PIN 4
+#endif
 
-bool transmit(uint8_t address, uint8_t buffer[], uint8_t buffer_size) {
+bool AHT10_transmit(uint8_t address, uint8_t buffer[], uint8_t buffer_size) {
     delay(10);  // This device needs some space after other I2C devices are done talking
     Wire.beginTransmission(address);
     uint8_t write_result = Wire.write(buffer, buffer_size);
@@ -61,7 +70,7 @@ bool transmit(uint8_t address, uint8_t buffer[], uint8_t buffer_size) {
     }
     return true;
 }
-uint8_t receive(uint8_t address, uint8_t out_buffer[], uint8_t buffer_size) {
+uint8_t AHT10_receive(uint8_t address, uint8_t out_buffer[], uint8_t buffer_size) {
     for (int i = 0; i < buffer_size; ++i) {
         out_buffer[i] = 0xFF;
     }
@@ -85,9 +94,9 @@ uint8_t receive(uint8_t address, uint8_t out_buffer[], uint8_t buffer_size) {
     return buffer_size;
 }
 
-uint8_t get_status(uint8_t address, bool print) {
+uint8_t AHT10_get_status(uint8_t address, bool print) {
     uint8_t buffer[1];
-    uint8_t received_length = receive(address, buffer, 1);
+    uint8_t received_length = AHT10_receive(address, buffer, 1);
     uint8_t status = buffer[0];
     if (received_length != 1) {
         status = 0xFF;
@@ -103,24 +112,24 @@ uint8_t get_status(uint8_t address, bool print) {
     }
     return status;
 }
-bool send_reset(uint8_t address) {
-    if (!transmit(address, &AHTX0_CMD_SOFTRESET, 1)) {
+bool AHT10_send_reset(uint8_t address) {
+    if (!AHT10_transmit(address, &AHTX0_CMD_SOFTRESET, 1)) {
         return false;
     }
     delay(20);
     return true;
 }
-Status calibrate(uint8_t address) {
-    if (!transmit(address, AHT10_CMD_CALIBRATE, 3)) {
+Status AHT10_calibrate(uint8_t address) {
+    if (!AHT10_transmit(address, AHT10_CMD_CALIBRATE, 3)) {
         return Status::StoppedResponding;
     }
     Serial.print("Calibrating.\n");
-    uint8_t status = get_status(address, true);
+    uint8_t status = AHT10_get_status(address, true);
 
     int attempts = 0;
     while ((status & AHTX0_STATUS_BUSY) != 0 && attempts < 100) {
         delay(20);
-        status = get_status(address, false);
+        status = AHT10_get_status(address, false);
     }
     if ((status & AHTX0_STATUS_BUSY) != 0) {
         Serial.print("Failed to calibrate.\n");
@@ -131,20 +140,20 @@ Status calibrate(uint8_t address) {
     }
 }
 
-Status initialize() {
+Status AHT10_initialize() {
     uint8_t address = AHTX0_I2CADDR_DEFAULT;
     Wire.begin(address);
     delay(20);
-    if (!send_reset(address)) {
+    if (!AHT10_send_reset(address)) {
         // Let reset fail, it's optional, and instead have the repeating status be
         // the more reliable sign that the circuit is broken
         //return Status::NotResponding;
     }
     delay(20);
-    uint8_t status = get_status(address, true);
+    uint8_t status = AHT10_get_status(address, true);
     int attempts = 0;
     while (status == 0xFF && attempts < 100) {
-        get_status(address, false);
+        AHT10_get_status(address, false);
         attempts += 1;
         delay(20);
     }
@@ -152,31 +161,21 @@ Status initialize() {
         Serial.print("AHT10 didn't respond.");
         return Status::NotResponding;
     }
-    return calibrate(address);
+    return AHT10_calibrate(address);
 }
 
-// Returns success
-bool read_data(uint8_t address, float& out_humidity, float& out_temperature, bool print) {
-    bool transmitted = transmit(address, AHTX0_CMD_TRIGGER, 3);
-    if (!transmitted) {
-        return false;
-    }
+bool AHT10_read_data_start(uint8_t address) {
+    return AHT10_transmit(address, AHTX0_CMD_TRIGGER, 3);
+}
 
-    int attempts = 0;
-    uint8_t status = get_status(address, false);
-    while ((status & AHTX0_STATUS_BUSY) != 0 && attempts < 100) {
-        delay(2000);
-        status = get_status(address, print);
-    }
+bool AHT10_read_data_result(uint8_t address, uint8_t status, int16_t& out_humidity_cents, int16_t& out_temperature_cents, bool print) {
     if ((status & AHTX0_STATUS_BUSY) != 0) {
-        if (print) {
-            Serial.print("Failed to generate new data.\n");
-        }
+        Serial.println("read_data_result called with busy status");
         return false;
     }
     const uint8_t buffer_size = 6;
     uint8_t buffer[buffer_size];
-    uint8_t received_length = receive(address, buffer, buffer_size);
+    uint8_t received_length = AHT10_receive(address, buffer, buffer_size);
     if (received_length != buffer_size) {
         Serial.print("Failed to read all bytes when reading data. Read ");
         Serial.print(received_length);
@@ -185,33 +184,29 @@ bool read_data(uint8_t address, float& out_humidity, float& out_temperature, boo
         Serial.print(" bytes.\n");
         return false;
     }
-    if (print) {
-        Serial.print("Raw data: ");
-        for (int i = 0; i < buffer_size; ++i) {
-            Serial.print((uint8_t) buffer[i], 16);
-        }
-        Serial.print(", ");
-    }
     uint32_t raw_humidity = (((uint32_t) buffer[1]) << 12) | (((uint32_t) buffer[2]) << 4) | (((uint32_t) buffer[3]) >> 4);
     uint32_t raw_temperature = ((((uint32_t) buffer[3]) & 0xF) << 16) | (((uint32_t) buffer[4]) << 8) | ((uint32_t) buffer[5]);
-    if (print) {
-        Serial.print("raw humidity: ");
-        Serial.print(raw_humidity, 16);
-        Serial.print(", raw temperature: ");
-        Serial.print(raw_temperature, 16);
-        Serial.print("\n");
-    }
+    out_humidity_cents = (uint16_t)(((((float) raw_humidity) * 100) / 0x100000) * 100.0f);
+    out_temperature_cents = (uint16_t)((((((float) raw_temperature) * 200) / 0x100000) - 50) * 100.0f);
 
-    out_humidity = (((float) raw_humidity) * 100) / 0x100000;
-    out_temperature = ((((float) raw_temperature) * 200) / 0x100000) - 50;
     return true;
+}
+float AHT10_convert_humidity(uint32_t raw_humidity) {
+    return (((float) raw_humidity) * 100) / 0x100000;
+}
+float AHT10_convert_temperature(uint32_t raw_temperature) {
+    return ((((float) raw_temperature) * 200) / 0x100000) - 50;
 }
 
 void writeString(char* text) {
-    char* c = text;
-    while (*c) {
-        display.write(*c);
-        c++;
+    if (SSD1306_ok) {
+        char* c = text;
+        while (*c) {
+            display.write(*c);
+            c++;
+        }
+    } else {
+        Serial.print(text);
     }
 }
 
@@ -242,8 +237,27 @@ void setup() {
     Serial.write("Wire begin\n");
 
     Wire.begin();
+
+    Serial.write("Display init\n");
+    if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {  // Address 0x3C for 128x32
+        SSD1306_ok = true;
+
+        display.setTextSize(1);       // Normal 1:1 pixel scale
+        display.setTextColor(WHITE);  // Draw white text
+        display.cp437(true);          // Use full 256 char 'Code Page 437' font
+        display.clearDisplay();
+        display.display();
+    } else {
+        SSD1306_ok = false;
+        Serial.println("SSD1306 allocation failed");
+    }
+
+    Serial.write("AHT10 init\n");
+    AHT10_status = AHT10_initialize();
+
     Serial.write("IMU init\n");
-    int err = IMU.init(calib, IMU_ADDRESS);
+    calData calibration;
+    int err = IMU.init(calibration, IMU_ADDRESS);
     if (err != 0) {
         Serial.print("Error initializing IMU: ");
         Serial.println(err);
@@ -251,42 +265,18 @@ void setup() {
     } else {
         BMI160_status = Status::Ok;
     }
-    Serial.write("AHT10 init\n");
-    AHT10_status = initialize();
 
-    Serial.write("Display init\n");
-    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {  // Address 0x3C for 128x32
-        Serial.println(F("SSD1306 allocation failed"));
-    }
-
-#if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
-    // If we're on raspberry pi pico
-    unsigned button1_pin = 7;
-    unsigned button2_pin = 8;
-#else
-    unsigned button1_pin = 5;
-    unsigned button2_pin = 4;
-#endif
-
-    pinMode(button1_pin,INPUT_PULLUP);
-    button1.attach(button1_pin);
-    button1.interval(10);// interval in ms
-    pinMode(button2_pin,INPUT_PULLUP);
-    button2.attach(button2_pin);
-    button2.interval(10); // interval in ms
-
-    display.setTextSize(1);       // Normal 1:1 pixel scale
-    display.setTextColor(WHITE);  // Draw white text
-    display.cp437(true);          // Use full 256 char 'Code Page 437' font
-    display.clearDisplay();
-    display.display();
+    pinMode(BUTTON1_PIN, INPUT_PULLUP);
+    pinMode(BUTTON2_PIN, INPUT_PULLUP);
 }
 
 void loop() {
-    Serial.println("Loop begin");
+//    Serial.println("Loop begin");
 
-    display.clearDisplay();
-    display.setCursor(0, 0);      // Start at top-left corner
+    if (SSD1306_ok) {
+        display.clearDisplay();
+        display.setCursor(0, 0);      // Start at top-left corner
+    }
 
     if (AHT10_status == Status::Unknown) {
         writeString("AHT10: Unknown\n");
@@ -294,16 +284,49 @@ void loop() {
         writeString("AHT10: No response\n");
     } else if (AHT10_status == Status::StoppedResponding) {
         writeString("AHT10: Stopped responding\n");
-    } else if (AHT10_status == Status::Ok) {
-        float humidity = 0.0f;
-        float temperature = 0.0f;
-        bool success = read_data(AHTX0_I2CADDR_DEFAULT, humidity, temperature, false);
+    } else if (AHT10_status == Status::Measuring || AHT10_status == Status::Ok)  {
+        // Functioning normally
+        uint8_t address = AHTX0_I2CADDR_DEFAULT;
+
+        if (AHT10_status == Status::Ok) {
+            // Start a new measurement
+            Serial.print("Starting new AHT10 measurement\n");
+            bool result = AHT10_read_data_start(address);
+            AHT10_attempts = 0;
+            if (result) {
+                AHT10_status = Status::Measuring;
+            } else {
+                AHT10_status = Status::StoppedResponding;
+            }
+        } else {
+            // Wait for the end of the measurement and then
+            uint8_t status = AHT10_get_status(address, false);
+            if ((status & AHTX0_STATUS_BUSY) != 0) {
+                // Still busy
+                if (AHT10_attempts > 100) {
+                    // Timeout
+                    Serial.print("Failed to generate new data.\n");
+                    AHT10_status = Status::StoppedResponding;
+                }
+            } else {
+                // No longer busy
+                Serial.print("Reading data from AHT10.\n");
+                bool success = AHT10_read_data_result(AHTX0_I2CADDR_DEFAULT, status, AHT10_humidity_cents, AHT10_temperature_cents, false);
+                if (success) {
+                    AHT10_status = Status::Ok;
+                } else {
+                    AHT10_status = Status::StoppedResponding;
+                }
+            }
+        }
+
+        // Regardless, print the latest data received
         //writeString("AHT10: H22 T26\n");
         writeString("AHT10: H");
-        writeIntString((uint32_t) humidity);
+        writeFloatString(((float)AHT10_humidity_cents) / 100.0f);
         writeString("% T");
-        //writeIntString((uint32_t) temperature);
-        writeFloatString(temperature);
+        //writeIntString((uint32_t) AHT10_temperature);
+        writeFloatString(((float)AHT10_temperature_cents) / 100.0f);
         writeString("C\n");
     }
     if (BMI160_status == Status::Unknown) {
@@ -313,20 +336,39 @@ void loop() {
     } else if (BMI160_status == Status::StoppedResponding) {
         writeString("BMI160: Stopped responding\n");
     } else if (BMI160_status == Status::Ok) {
+        AccelData accelData;
         IMU.update();
         IMU.getAccel(&accelData);
         float temperature = IMU.getTemp();
         float accelY = accelData.accelY;
         float accelX = accelData.accelX;
-        float factor = 2.5;
-        int16_t x = CIRCLE_RADIUS + ((accelY * factor + 1) / 2) * (SCREEN_WIDTH - CIRCLE_RADIUS);
-        int16_t y = CIRCLE_RADIUS + ((accelX * factor + 1) / 2) * (SCREEN_HEIGHT - CIRCLE_RADIUS);
+        int16_t center_x = SCREEN_WIDTH - (BOX_SIDE / 2);
+        int16_t center_y = SCREEN_HEIGHT - (BOX_SIDE / 2);
+        float factor = 50.0f;
+        int16_t x = accelY * factor;
+        int16_t y = accelX * factor;
+
+        int16_t extents = BOX_SIDE / 2 - 4;
+        if (x > extents) {
+            x = extents;
+        } else if (x < -extents) {
+            x = -extents;
+        };
+        if (y > extents) {
+            y = extents;
+        } else if (y < -extents) {
+            y = -extents;
+        };
+        if (SSD1306_ok) {
+            display.drawRect(SCREEN_WIDTH - BOX_SIDE, SCREEN_HEIGHT - BOX_SIDE, BOX_SIDE, BOX_SIDE, WHITE);
+            display.drawCircle(x + center_x, y + center_y, CIRCLE_RADIUS, SSD1306_WHITE);
+        }
 
         //writeString("BMI160: X0Y0 T26\n");
         writeString("BMI160: X");
-        writeIntString((uint32_t) x);
+        writeIntString((uint32_t) (accelX*100));
         writeString("Y");
-        writeIntString((uint32_t) y);
+        writeIntString((uint32_t) (accelY*100));
         writeString(" T");
         //writeIntString((uint32_t) temperature);
         writeFloatString(temperature);
@@ -336,21 +378,25 @@ void loop() {
 
     //writeString("B1: UP  , B2: DOWN");
     writeString("B1: ");
-    button1.update();
-    if (button1.read() == LOW) {
+    if (digitalRead(BUTTON1_PIN) == LOW) {
         writeString("DOWN");
     } else {
         writeString("UP  ");
     }
     writeString(", B2: ");
-    button2.update();
-    if (button2.read() == LOW) {
+    if (digitalRead(BUTTON2_PIN) == LOW) {
         writeString("DOWN");
     } else {
         writeString("UP  ");
     }
     writeString("\n");
-    display.display();
+    if (SSD1306_ok) {
+        display.display();
+    } else {
+        // If the display is not working,
+        // Give ourselves a chance to read the serial log
+        delay(2000);
+    }
     return;
 
 
