@@ -11,6 +11,7 @@ enum class Status {
     NotResponding,
     StoppedResponding,
     Ok,
+    Measuring,
 };
 
 #define IMU_ADDRESS 0x69  //Change to the address of the IMU
@@ -27,6 +28,8 @@ uint8_t AHTX0_CMD_SOFTRESET = 0xBA;                     // Soft reset command
 uint8_t AHTX0_STATUS_BUSY = 0x80;                       // Status bit for busy
 uint8_t AHTX0_STATUS_CALIBRATED = 0x08;                 // Status bit for calibrated
 Status AHT10_status = Status::Unknown;
+uint16_t AHT10_attempts = 0;
+
 float AHT10_humidity = 0.0f;
 float AHT10_temperature = 0.0f;
 
@@ -98,7 +101,7 @@ uint8_t AHT10_receive(uint8_t address, uint8_t out_buffer[], uint8_t buffer_size
     return buffer_size;
 }
 
-uint8_t get_status(uint8_t address, bool print) {
+uint8_t AHT10_get_status(uint8_t address, bool print) {
     uint8_t buffer[1];
     uint8_t received_length = AHT10_receive(address, buffer, 1);
     uint8_t status = buffer[0];
@@ -116,17 +119,17 @@ uint8_t get_status(uint8_t address, bool print) {
     }
     return status;
 }
-Status calibrate(uint8_t address) {
+Status AHT10_calibrate(uint8_t address) {
     if (!AHT10_transmit(address, AHT10_CMD_CALIBRATE, 3)) {
         return Status::StoppedResponding;
     }
     Serial.print("Calibrating.\n");
-    uint8_t status = get_status(address, true);
+    uint8_t status = AHT10_get_status(address, true);
 
     int attempts = 0;
     while ((status & AHTX0_STATUS_BUSY) != 0 && attempts < 100) {
         delay(20);
-        status = get_status(address, false);
+        status = AHT10_get_status(address, false);
     }
     if ((status & AHTX0_STATUS_BUSY) != 0) {
         Serial.print("Failed to calibrate.\n");
@@ -147,10 +150,10 @@ Status AHT10_initialize() {
         //return Status::NotResponding;
     }
     delay(20);
-    uint8_t status = get_status(address, true);
+    uint8_t status = AHT10_get_status(address, true);
     int attempts = 0;
     while (status == 0xFF && attempts < 100) {
-        get_status(address, false);
+        status = AHT10_get_status(address, false);
         attempts += 1;
         delay(20);
     }
@@ -158,7 +161,7 @@ Status AHT10_initialize() {
         Serial.print("AHT10 didn't respond.");
         return Status::NotResponding;
     }
-    return calibrate(address);
+    return AHT10_calibrate(address);
 }
 bool AHT10_read_data_start(uint8_t address) {
     return AHT10_transmit(address, AHTX0_CMD_TRIGGER, 3);
@@ -292,30 +295,44 @@ void loop() {
         writeString("AHT10: No response\n");
     } else if (AHT10_status == Status::StoppedResponding) {
         writeString("AHT10: Stopped responding\n");
-    } else if (AHT10_status == Status::Ok) {
+    } else if (AHT10_status == Status::Ok || AHT10_status == Status::Measuring) {
+        // This sensor freezes the arduino after a random amount of time for some reason.
+        // That amount of time is larger if it gets some space between its communication and other sensor's
         uint8_t address = AHTX0_I2CADDR_DEFAULT;
-        if (!AHT10_read_data_start(address)) {
-            AHT10_status = Status::StoppedResponding;
+        delay(50);
+        if (AHT10_status == Status::Ok) {
+            if (AHT10_read_data_start(address)) {
+                AHT10_status = Status::Measuring;
+                AHT10_attempts = 0;
+            } else {
+                AHT10_status = Status::StoppedResponding;
+            }
+        } else /* if (AHT10_status == Status::Measuring( */ {
+            uint8_t status = AHT10_get_status(address, false);
+            if ((status & AHTX0_STATUS_BUSY) != 0) {
+                // Busy
+                AHT10_attempts += 1;
+                if (AHT10_attempts > 10000) {
+                    AHT10_status = Status::StoppedResponding;
+                    Serial.print("Failed to generate new data.\n");
+                }
+            } else {
+                // Not busy, measurement done!
+                bool success = AHT10_read_data_result(address, status, AHT10_humidity, AHT10_temperature, false);
+                if (success) {
+                    AHT10_status = Status::Ok;
+                } else {
+                    AHT10_status = Status::StoppedResponding;
+                }
+            }
         }
-        int attempts = 0;
-        uint8_t status = get_status(address, false);
-        while ((status & AHTX0_STATUS_BUSY) != 0 && attempts < 100) {
-            delay(2000);
-            status = get_status(address, false);
-        }
-        if ((status & AHTX0_STATUS_BUSY) != 0) {
-            Serial.print("Failed to generate new data.\n");
-            AHT10_status = Status::StoppedResponding;
-        } else {
-            bool success = AHT10_read_data_result(address, status, AHT10_humidity, AHT10_temperature, false);
-            //writeString("AHT10: H22 T26\n");
-            writeString("AHT10: H");
-            writeIntString((uint32_t) AHT10_humidity);
-            writeString("% T");
-            //writeIntString((uint32_t) temperature);
-            writeFloatString(AHT10_temperature);
-            writeString("C\n");
-        }
+        delay(50);
+
+        writeString("AHT10: H");
+        writeIntString((uint32_t) AHT10_humidity);
+        writeString("% T");
+        writeFloatString(AHT10_temperature);
+        writeString("C\n");
     }
     if (BMI160_status == Status::Unknown) {
         writeString("BMI160: Unknown\n");
@@ -336,13 +353,13 @@ void loop() {
         int16_t extents = BOX_SIDE / 2 - 4;
         if (x > extents) {
             x = extents;
-        } else if (x < -extents) {
-            x = -extents;
+        } else if (x < -extents - 1) {
+            x = -extents - 1;
         };
         if (y > extents) {
             y = extents;
-        } else if (y < -extents) {
-            y = -extents;
+        } else if (y < -extents - 1) {
+            y = -extents - 1;
         };
         if (SSD1306_ok) {
             display.drawRect(SCREEN_WIDTH - BOX_SIDE, SCREEN_HEIGHT - BOX_SIDE, BOX_SIDE, BOX_SIDE, WHITE);
@@ -378,7 +395,8 @@ void loop() {
     if (SSD1306_ok) {
         display.display();
     } else {
-        // Give ourselves a chance to read the serial log
+        // If the screen fails, we instead print the data.
+        // If so, we pause to give ourselves a chance to read the serial log
         delay(2000);
     }
 }
