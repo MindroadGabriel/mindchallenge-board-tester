@@ -6,6 +6,10 @@
 #include <inttypes.h>
 #include "FastIMU.h"
 
+// If we have a new board, which can contain both a raspberry and an arduino,
+// but nevertheless we have have an arduino mounted, set this to true.
+#define ARDUINO_ON_NEW_BOARD 0
+
 // The status reflects our understanding of the current state of each sensor
 enum class Status {
     Unknown,
@@ -57,14 +61,19 @@ bool SSD1306_ok = false;
 #define CIRCLE_RADIUS 3  // IMU rendering circle
 #define OLED_RESET -1  // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
 // The driver uses malloc by default, and it fails without much reason.
 // We statically allocate it instead, and assign it despite it being protected
 // via a subclass hack
+// We skip this on raspberry pi though
+#if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
+#else
 uint8_t display_buffer[SCREEN_WIDTH * ((SCREEN_HEIGHT + 7) / 8)];
 class Adafruit_BufferEdit : public Adafruit_SSD1306 {
 public:
     void setBuffer(uint8_t *new_buffer) { buffer = new_buffer; }
 };
+#endif
 
 // Buttons
 // Pins for buttons vary depending on hardware
@@ -163,7 +172,6 @@ Status AHT10_calibrate(uint8_t address) {
 
 Status AHT10_initialize() {
     uint8_t address = AHTX0_I2CADDR_DEFAULT;
-    Wire.begin(address);
     delay(20);
     if (!AHT10_transmit(address, &AHTX0_CMD_SOFTRESET, 1)) {
         // Let reset fail, it's optional, and instead have the repeating status be
@@ -273,6 +281,7 @@ void setup() {
 
     Serial.write("Wire begin\n");
     Wire.begin();
+    Wire.setClock(10000); //400khz clock
 
     // Initialize the IMU. The IMU can be expected to work right away if it's connected properly, and keep working if so.
     Serial.write("IMU init\n");
@@ -290,12 +299,16 @@ void setup() {
     AHT10_status = AHT10_initialize();
 
     // Set up our display using the hack we wrote above.
+    // But not if we're on raspberry pi
+    Serial.write("Display init\n");
+#if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
+#else
+    static_cast<Adafruit_BufferEdit*>(&display)->setBuffer(display_buffer);
+#endif
     // If this fails and ok is set to false, we write nothing to the display,
     // and instead print to the usb serial bus so we can diagnose the other devices
     // We don't always print to the usb serial bus because a refresh rate that seems
     // reasonable on the display is high enough to spam usb serial, and that would hide more rare errors.
-    Serial.write("Display init\n");
-    static_cast<Adafruit_BufferEdit*>(&display)->setBuffer(display_buffer);
     if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {  // Address 0x3C for 128x32
         SSD1306_ok = true;
 
@@ -412,9 +425,16 @@ void loop() {
         float factor = 50.0f;
 
         // Screen coordinate for the circle
+#if (BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0) || ARDUINO_ON_NEW_BOARD != 0
+        // On the new board raspberry pi board, the orientation of the accelerometer
+        // is not the same as the old board, so we do this transformation
+        int16_t x = -accelData.accelX * factor;
+        int16_t y = accelData.accelY * factor;
+#else
         // Note that y is rotation around the y axis, which means it maps to the x coordinate on screen, and vice versa.
         int16_t x = accelData.accelY * factor;
         int16_t y = accelData.accelX * factor;
+#endif
 
         // Clamp the movement of the circle within the box
         int16_t extents = BOX_SIDE / 2 - 4;
