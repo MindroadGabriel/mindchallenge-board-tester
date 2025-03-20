@@ -80,7 +80,7 @@
 
 // If we have a new board, which can contain both a raspberry and an arduino,
 // and we have an arduino mounted, set this to 1.
-#define ARDUINO_ON_REV3 0
+#define ARDUINO_ON_REV3 1
 
 #if BOARD_VENDORID == 0x2e8a && BOARD_PRODUCTID == 0x00c0
 #define RASPBERRY_PI_PICO 1
@@ -147,6 +147,9 @@ bool SSD1306_ok = false;
 #define OLED_RESET -1  // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+uint16_t led_timing = 0;
+uint16_t print_timing = 0;
+
 // The driver uses malloc by default, and it fails without much reason.
 // We statically allocate it instead, and assign it despite it being protected
 // via a subclass hack
@@ -167,11 +170,32 @@ public:
 #define BUTTON2_PIN 8
 #define POTENTIOMETER1_PIN 26
 #define POTENTIOMETER2_PIN 27
+#define ONBOARD_LED_PIN 25
+#define LED1_PIN 3
+#define LED2_PIN 6
+#define LED3_PIN 9
+#define LED4_PIN 10
+
 #else
+#if ARDUINO_ON_REV3 == 1
+#define BUTTON1_PIN 7
+#define BUTTON2_PIN 8
+#define POTENTIOMETER1_PIN A0
+#define POTENTIOMETER2_PIN A1
+#define ONBOARD_LED_PIN LED_BUILTIN
+#define LED1_PIN 3
+#define LED2_PIN 6
+#define LED3_PIN 9
+#define LED4_PIN 10
+#else
+
 #define BUTTON1_PIN 5
 #define BUTTON2_PIN 4
 #define POTENTIOMETER1_PIN A0
-#define POTENTIOMETER2_PIN A1
+#define POTENTIOMETER2_PIN 
+#define ONBOARD_LED_PIN LED_BUILTIN
+
+#endif
 #endif
 
 ////////////////////////////////////
@@ -327,13 +351,12 @@ bool AHT10_read_data_result(uint8_t address, uint8_t status, float& out_humidity
 
 // Helper functions for printing to the display
 void writeString(char* text) {
-    if (SSD1306_ok) {
-        char* c = text;
-        while (*c) {
-            display.write(*c);
-            c++;
-        }
-    } else {
+    char* c = text;
+    while (*c) {
+        display.write(*c);
+        c++;
+    }
+    if (print_timing == 5){
         Serial.print(text);
     }
 }
@@ -414,9 +437,63 @@ void setup() {
     // in order to detect that the button has been connected to ground (been pressed)
     pinMode(BUTTON1_PIN, INPUT_PULLUP);
     pinMode(BUTTON2_PIN, INPUT_PULLUP);
+
+    pinMode(ONBOARD_LED_PIN, OUTPUT);
+#if REV3_BOARD
+    pinMode(LED1_PIN, OUTPUT);
+    pinMode(LED2_PIN, OUTPUT);
+    pinMode(LED3_PIN, OUTPUT);
+    pinMode(LED4_PIN, OUTPUT);
+
+#endif
 }
 
 void loop() {
+    if (led_timing < 10) {
+        digitalWrite(ONBOARD_LED_PIN, 1);
+#if REV3_BOARD
+        digitalWrite(LED1_PIN, 1);
+        digitalWrite(LED2_PIN, 0);
+        digitalWrite(LED3_PIN, 0);
+        digitalWrite(LED4_PIN, 0);
+#endif
+    } else if (led_timing < 20) {
+        digitalWrite(ONBOARD_LED_PIN, 0);
+#if REV3_BOARD
+        digitalWrite(LED1_PIN, 0);
+        digitalWrite(LED2_PIN, 1);
+        digitalWrite(LED3_PIN, 0);
+        digitalWrite(LED4_PIN, 0);
+#endif
+    } else if (led_timing < 30) {
+        digitalWrite(ONBOARD_LED_PIN, 1);
+#if REV3_BOARD
+        digitalWrite(LED1_PIN, 0);
+        digitalWrite(LED2_PIN, 0);
+        digitalWrite(LED3_PIN, 1);
+        digitalWrite(LED4_PIN, 0);
+#endif
+    } else if (led_timing < 40) {
+        digitalWrite(ONBOARD_LED_PIN, 0);
+#if REV3_BOARD
+        digitalWrite(LED1_PIN, 0);
+        digitalWrite(LED2_PIN, 0);
+        digitalWrite(LED3_PIN, 0);
+        digitalWrite(LED4_PIN, 1);
+#endif
+    } else {
+        led_timing = 1;
+    }
+    led_timing++;
+    if (print_timing > 40) {
+        print_timing = 0;
+        Serial.print("\n\n--\n");
+    } else {
+        print_timing ++;
+    }
+
+
+
     // We must always set the cursor to the stop of the screen each time we start over
     // because otherwise we'll write way outside the screen after the first couple loops
     // Most calls to the display driver doesn't actually communicate with the screen.
